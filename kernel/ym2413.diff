@@ -1,0 +1,996 @@
+diff -urN a/sound/core/seq/Makefile b/sound/core/seq/Makefile
+--- a/sound/core/seq/Makefile	2015-06-22 14:05:43.000000000 +0900
++++ b/sound/core/seq/Makefile	2015-07-21 02:13:30.097884754 +0900
+@@ -27,3 +27,4 @@
+ obj-$(CONFIG_SND_OPL4_LIB_SEQ) += snd-seq-midi-event.o snd-seq-midi-emul.o
+ obj-$(CONFIG_SND_SBAWE_SEQ) += snd-seq-midi-emul.o snd-seq-virmidi.o
+ obj-$(CONFIG_SND_EMU10K1_SEQ) += snd-seq-midi-emul.o snd-seq-virmidi.o
++obj-$(CONFIG_SND_YM2413) += snd-seq-midi-event.o snd-seq-midi-emul.o
+バイナリーファイル a/sound/drivers/.ym2413.c.swp とb/sound/drivers/.ym2413.c.swp は異なります
+diff -urN a/sound/drivers/Kconfig b/sound/drivers/Kconfig
+--- a/sound/drivers/Kconfig	2015-06-22 14:05:43.000000000 +0900
++++ b/sound/drivers/Kconfig	2015-07-24 14:47:07.458530714 +0900
+@@ -181,6 +181,18 @@
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called snd-ml403_ac97cr.
+ 
++config SND_YM2413
++	tristate "YM2413 Sequencer"
++	depends on SND_SEQUENCER && I2C
++	help
++   ym2413
++
++config SND_PRINTKMIDI
++	tristate "printk Sequencer"
++	depends on SND_SEQUENCER
++	help
++   wtf
++
+ config SND_AC97_POWER_SAVE
+ 	bool "AC97 Power-Saving Mode"
+ 	depends on SND_AC97_CODEC
+diff -urN a/sound/drivers/Makefile b/sound/drivers/Makefile
+--- a/sound/drivers/Makefile	2015-06-22 14:05:43.000000000 +0900
++++ b/sound/drivers/Makefile	2015-07-24 14:47:50.361530533 +0900
+@@ -11,6 +11,8 @@
+ snd-serial-u16550-objs := serial-u16550.o
+ snd-virmidi-objs := virmidi.o
+ snd-ml403-ac97cr-objs := ml403-ac97cr.o pcm-indirect2.o
++snd-ym2413-objs := ym2413.o
++snd-printkmidi-objs := printkmidi.o
+ 
+ # Toplevel Module Dependency
+ obj-$(CONFIG_SND_DUMMY) += snd-dummy.o
+@@ -21,5 +23,7 @@
+ obj-$(CONFIG_SND_MTS64) += snd-mts64.o
+ obj-$(CONFIG_SND_PORTMAN2X4) += snd-portman2x4.o
+ obj-$(CONFIG_SND_ML403_AC97CR) += snd-ml403-ac97cr.o
++obj-$(CONFIG_SND_YM2413) += snd-ym2413.o
++obj-$(CONFIG_SND_PRINTKMIDI) += snd-printkmidi.o
+ 
+ obj-$(CONFIG_SND) += opl3/ opl4/ mpu401/ vx/ pcsp/
+diff -urN a/sound/drivers/printkmidi.c b/sound/drivers/printkmidi.c
+--- a/sound/drivers/printkmidi.c	1970-01-01 09:00:00.000000000 +0900
++++ b/sound/drivers/printkmidi.c	2015-08-14 23:58:17.103409276 +0900
+@@ -0,0 +1,385 @@
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <sound/core.h>
++#include <sound/initval.h>
++#include <sound/seq_kernel.h>
++#include <sound/seq_device.h>
++#include <sound/rawmidi.h>
++#include <sound/info.h>
++#include <sound/control.h>
++#include <sound/minors.h>
++#include <sound/seq_midi_event.h>
++#include <sound/seq_midi_emul.h>
++#include <linux/platform_device.h>
++#include <linux/workqueue.h>
++
++#define SNDRV_PRINTKMIDI_SUBSCRIBE  (1<<0)
++#define SNDRV_PRINTKMIDI_USE  (1<<1)
++
++struct snd_seq_printk_dev {
++  struct work_struct work;
++  struct workqueue_struct *work_queue;
++  struct snd_card *card;
++  int seq_client;
++  struct snd_midi_channel_set * chset;
++  int device;
++  int client;   /* created/attached client */
++  int port;   /* created/attached port */
++  unsigned int flags;  /* SNDRV_PRINTKMIDI_* */
++  raw_spinlock_t bus_lock;
++  int current_program[16];
++  unsigned char buffer[128];
++  unsigned char *buffer_head;
++};
++
++struct snd_printk {
++  struct snd_card *card;
++  struct snd_seq_device *seq;
++	 struct device dev;
++  struct snd_seq_printk_dev *rdev;
++};
++
++static void snd_printk_worker( struct work_struct *work ) {
++  unsigned long flags;
++  struct snd_seq_printk_dev *rdev;
++  unsigned char *cur;
++  rdev = (struct snd_seq_printk_dev*)work;
++  raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++  for( cur = rdev->buffer; cur != rdev->buffer_head; ++cur ) {
++    printk( "%x ", (int)*cur );
++  }
++  rdev->buffer_head = rdev->buffer;
++  raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  printk( "\n" );
++}
++
++void snd_printk_note_on(void *p, int note, int vel, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  bool send_program_change = false;
++  struct snd_seq_printk_dev *rdev;
++  rdev = p;
++  if( chan->midi_program != rdev->current_program[ chan->number ] ) {
++    rdev->current_program[ chan->number ] = chan->midi_program;
++    send_program_change = true;
++  }
++  if( send_program_change ) {
++    if( rdev->buffer_head < rdev->buffer + 123 ) {
++      raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++      *rdev->buffer_head = 0x50 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = chan->midi_program;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = 0x10 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = note;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = vel * chan->gm_volume * chan->gm_expression / 128 / 128;
++      ++rdev->buffer_head;
++      raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++    }
++  }
++  else {
++    if( rdev->buffer_head < rdev->buffer + 125 ) {
++      raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++      *rdev->buffer_head = 0x10 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = note;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = vel * chan->gm_volume * chan->gm_expression / 128 / 128;
++      ++rdev->buffer_head;
++      raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++    }
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_printk_note_off(void *p, int note, int vel, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_printk_dev *rdev;
++  rdev = p;
++  if( rdev->buffer_head < rdev->buffer + 126 ) {
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++    *rdev->buffer_head = 0x20 | chan->number;
++    ++rdev->buffer_head;
++    *rdev->buffer_head = note;
++    ++rdev->buffer_head;
++    raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_printk_key_press(void *p, int note, int vel, struct snd_midi_channel *chan) {
++}
++
++void snd_printk_terminate_note(void *p, int note, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_printk_dev *rdev;
++  rdev = p;
++  if( rdev->buffer_head < rdev->buffer + 126 ) {
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++    *rdev->buffer_head = 0x20 | chan->number;
++    ++rdev->buffer_head;
++    *rdev->buffer_head = note;
++    ++rdev->buffer_head;
++    raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_printk_control(void *p, int type, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_printk_dev *rdev;
++  rdev = p;
++  if( type == SNDRV_SEQ_EVENT_PITCHBEND ) {
++    unsigned int pitch = chan->midi_pitchbend + 8192;
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++    printk( "Pitch: %d %d\n", chan->number, pitch );
++    raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  }
++}
++
++void snd_printk_nrpn(void *p, struct snd_midi_channel *chan, struct snd_midi_channel_set *chset) {
++}
++
++void snd_printk_sysex(void *p, unsigned char *buf, int len, int parsed, struct snd_midi_channel_set *chset) {
++}
++
++struct snd_midi_op printk_ops = {
++  .note_on =  snd_printk_note_on,
++  .note_off =  snd_printk_note_off,
++  .key_press =  snd_printk_key_press,
++  .note_terminate = snd_printk_terminate_note,
++  .control =  snd_printk_control,
++  .nrpn =   snd_printk_nrpn,
++  .sysex =  snd_printk_sysex,
++};
++
++/*
++ * event input callback - just redirect events to subscribers
++ */
++static int printk_input(struct snd_seq_event *ev, int direct, void *private_data,
++	    int atomic, int hop) {
++	 struct snd_seq_printk_dev *rdev;
++  rdev = private_data;
++  if (!(rdev->flags & SNDRV_PRINTKMIDI_USE))
++    return 0; /* ignored */
++  snd_midi_process_event( &printk_ops, ev, rdev->chset );
++  return 0;
++}
++
++/*
++ * free_private callback
++ */
++static void printk_free(void *private_data) {}
++
++static int printk_subscribe(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_printk_dev *rdev;
++  rdev = private_data;
++  if (!try_module_get(rdev->card->module))
++    return -EFAULT;
++  rdev->flags |= SNDRV_PRINTKMIDI_SUBSCRIBE;
++  return 0;
++}
++
++static int printk_unsubscribe(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_printk_dev *rdev;
++  rdev = private_data;
++  rdev->flags &= ~SNDRV_PRINTKMIDI_SUBSCRIBE;
++  module_put(rdev->card->module);
++  return 0;
++}
++
++static int printk_use(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_printk_dev *rdev;
++  rdev = private_data;
++  if (!try_module_get(rdev->card->module))
++    return -EFAULT;
++  rdev->flags |= SNDRV_PRINTKMIDI_USE;
++  return 0;
++}
++
++static int printk_unuse(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_printk_dev *rdev;
++  rdev = private_data;
++  rdev->flags &= ~SNDRV_PRINTKMIDI_USE;
++  module_put(rdev->card->module);
++  return 0;
++}
++
++
++/*
++ * create a port
++ */
++static struct snd_seq_printk_dev *create_port( int client, int type ) {
++	 struct snd_seq_port_info pinfo;
++	 struct snd_seq_port_callback pcb;
++	 struct snd_seq_printk_dev *rdev;
++	 if ((rdev = kzalloc(sizeof(*rdev), GFP_KERNEL)) == NULL) return NULL;
++		rdev->client = client;
++		memset(&pinfo, 0, sizeof(pinfo));
++		pinfo.addr.client = client;
++  strcpy( pinfo.name, "printk" );
++		pinfo.capability = SNDRV_SEQ_PORT_CAP_READ | SNDRV_SEQ_PORT_CAP_SUBS_READ;
++		pinfo.capability |= SNDRV_SEQ_PORT_CAP_WRITE | SNDRV_SEQ_PORT_CAP_SUBS_WRITE;
++  pinfo.capability |= SNDRV_SEQ_PORT_CAP_DUPLEX;
++  pinfo.type = SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC
++     | SNDRV_SEQ_PORT_TYPE_SOFTWARE
++     | SNDRV_SEQ_PORT_TYPE_PORT;
++  pinfo.midi_channels = 16;
++		memset(&pcb, 0, sizeof(pcb));
++		pcb.owner = THIS_MODULE;
++  pcb.subscribe = printk_subscribe;
++  pcb.unsubscribe = printk_unsubscribe;
++  pcb.use = printk_use;
++  pcb.unuse = printk_unuse;
++  pcb.event_input = printk_input;
++		pcb.private_data = rdev;
++		pinfo.kernel = &pcb;
++		if ( snd_seq_kernel_client_ctl(client, SNDRV_SEQ_IOCTL_CREATE_PORT, &pinfo) < 0 ) {
++	 	 kfree(rdev);
++		  return NULL;
++	 }
++	 rdev->port = pinfo.addr.port;
++  memset( rdev->current_program, 0, sizeof(int)*16);
++  raw_spin_lock_init(&rdev->bus_lock);
++	 return rdev;
++}
++
++static int snd_printkmidi_probe( struct platform_device *devptr ) {
++  struct snd_card *card;
++  struct snd_printk *printk_;
++  struct snd_seq_printk_dev *rdev;
++  int err;
++  int client;
++  card = NULL;
++  err = snd_card_new(
++    &devptr->dev, -1, NULL, THIS_MODULE, sizeof(struct snd_printk ), &card
++  );
++  if( err < 0 ) {
++    dev_err( &devptr->dev, "Unable to create snd_card: %d\n", err );
++    return err;
++  }
++  printk_ = card->private_data;
++  printk_->card = card;
++
++ 	/* create client */
++	 client = snd_seq_create_kernel_client( card, 0, "printk" );
++	 if ( client < 0 ) {
++    snd_card_free( card );
++		  return client;
++  }
++	 rdev = create_port( client, 0 );
++	 if ( rdev == NULL ) {
++	  	snd_seq_delete_kernel_client( client );
++    snd_card_free( card );
++		  return -ENOMEM;
++	 }
++  printk_->rdev = rdev;
++  rdev->buffer_head = rdev->buffer;
++  rdev->work_queue = NULL;
++  rdev->card = card;
++  rdev->chset = snd_midi_channel_alloc_set( 16 );
++  if ( rdev->chset == NULL ) {
++    kfree( rdev );
++	  	snd_seq_delete_kernel_client( client );
++    snd_card_free( card );
++    err = -ENOMEM;
++  }
++  rdev->client = client;
++  rdev->chset->client = client;
++  rdev->chset->private_data = rdev;
++
++  strcpy(card->driver, "printk");
++  strcpy(card->shortname, "printk");
++  sprintf(card->longname, "printk Card %i", devptr->id + 1);
++  rdev->work_queue = create_workqueue("printkmidi_queue");
++  INIT_WORK( (struct work_struct *)rdev, snd_printk_worker );
++  err = snd_card_register(card);
++  if (!err) {
++    platform_set_drvdata(devptr, card);
++    return 0;
++  }
++  kfree( rdev );
++	 snd_seq_delete_kernel_client( client );
++  snd_card_free(card);
++  return err;
++}
++
++static int snd_printkmidi_remove(struct platform_device *devptr) {
++  struct snd_card *card;
++  struct snd_printk *printk_;
++  struct snd_seq_printk_dev *rdev;
++  card = platform_get_drvdata(devptr);
++  if( card ) {
++    printk_ = card->private_data;
++    if( printk_ ) {
++      rdev = printk_->rdev;
++      if( rdev ) {
++        flush_workqueue( rdev->work_queue );
++        destroy_workqueue( rdev->work_queue );
++        snd_midi_channel_free_set( rdev->chset );
++	       snd_seq_delete_kernel_client( rdev->client );
++	       kfree( rdev );
++      }
++    }
++    snd_card_free( card );
++  }
++  return 0;
++}
++
++static struct platform_driver snd_printkmidi_driver = {
++  .probe  = snd_printkmidi_probe,
++  .remove  = snd_printkmidi_remove,
++  .driver  = {
++    .name = "snd_printk",
++  },
++};
++
++static struct platform_device *device;
++
++static void snd_printkmidi_unregister_all(void) {
++  platform_device_unregister(device);
++  device = NULL;
++  platform_driver_unregister(&snd_printkmidi_driver);
++}
++
++
++static int __init alsa_card_printkmidi_init(void) {
++	 int err;
++		struct platform_device *device_;
++	 err = platform_driver_register(&snd_printkmidi_driver);
++	 if (err < 0) return err;
++
++	 device_ = platform_device_register_simple( "snd_printk", 0, NULL, 0);
++ 	if (IS_ERR(device_)) {
++    device = NULL;
++#ifdef MODULE
++  		printk(KERN_ERR "Card-printkMIDI soundcard not found or device busy 1\n");
++#endif
++	  	snd_printkmidi_unregister_all();
++	 	 return -ENODEV;
++  }
++	 if (!platform_get_drvdata(device_)) {
++    platform_device_unregister(device_);
++    device = NULL;
++#ifdef MODULE
++    printk(KERN_ERR "Card-printkMIDI soundcard not found or device busy\n");
++#endif
++	 	 snd_printkmidi_unregister_all();
++		  return -ENODEV;
++	 }
++  device = device_;
++	 return 0;
++}
++
++static void __exit alsa_card_printkmidi_exit(void) {
++  snd_printkmidi_unregister_all();
++}
++
++module_init(alsa_card_printkmidi_init);
++module_exit(alsa_card_printkmidi_exit);
++
++MODULE_AUTHOR("Naomasa Matsubayashi <>");
++MODULE_DESCRIPTION("printk Client Driver");
++MODULE_LICENSE("GPL");
++
+diff -urN a/sound/drivers/ym2413.c b/sound/drivers/ym2413.c
+--- a/sound/drivers/ym2413.c	1970-01-01 09:00:00.000000000 +0900
++++ b/sound/drivers/ym2413.c	2015-08-14 23:35:56.490961225 +0900
+@@ -0,0 +1,381 @@
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <sound/core.h>
++#include <sound/initval.h>
++#include <sound/seq_kernel.h>
++#include <sound/seq_device.h>
++#include <sound/rawmidi.h>
++#include <sound/info.h>
++#include <sound/control.h>
++#include <sound/minors.h>
++#include <sound/seq_midi_event.h>
++#include <sound/seq_midi_emul.h>
++#include <linux/workqueue.h>
++
++#define SNDRV_PRINTKMIDI_SUBSCRIBE  (1<<0)
++#define SNDRV_PRINTKMIDI_USE  (1<<1)
++
++struct snd_seq_ym2413_dev {
++  struct work_struct work;
++  struct workqueue_struct *work_queue;
++  struct snd_card *card;
++  int seq_client;
++  struct snd_midi_channel_set * chset;
++  int device;
++  int client;   /* created/attached client */
++  int port;   /* created/attached port */
++  unsigned int flags;  /* SNDRV_PRINTKMIDI_* */
++  raw_spinlock_t bus_lock;
++  struct i2c_client *bus;
++  int current_program[16];
++  unsigned char buffer[128];
++  unsigned char *buffer_head;
++};
++
++struct snd_ym2413 {
++  struct snd_card *card;
++  struct snd_seq_device *seq;
++	 struct device dev;
++  struct snd_seq_ym2413_dev *rdev;
++};
++
++int __i2c_master_send(const struct i2c_client *client, const char *buf, int count) {
++  int ret;
++  struct i2c_adapter *adap = client->adapter;
++  struct i2c_msg msg;
++  msg.addr = client->addr;
++  msg.flags = client->flags & I2C_M_TEN;
++  msg.len = count;
++  msg.buf = (char *)buf;
++
++  ret = __i2c_transfer(adap, &msg, 1);
++
++  /*
++   * If everything went ok (i.e. 1 msg transmitted), return #bytes
++   * transmitted, else error code.
++   */
++  return (ret == 1) ? count : ret;
++}
++
++static void snd_ym2413_worker( struct work_struct *work ) {
++  unsigned long flags;
++  struct snd_seq_ym2413_dev *rdev;
++  unsigned char buffer[128];
++  unsigned int buffer_size = 0;
++  rdev = (struct snd_seq_ym2413_dev*)work;
++  raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++  buffer_size = rdev->buffer_head - rdev->buffer;
++  memcpy( buffer, rdev->buffer, buffer_size );
++  rdev->buffer_head = rdev->buffer;
++  raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  i2c_master_send( rdev->bus, buffer, buffer_size );
++}
++
++void snd_ym2413_note_on(void *p, int note, int vel, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  bool send_program_change = false;
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = p;
++  if( chan->midi_program != rdev->current_program[ chan->number ] ) {
++    rdev->current_program[ chan->number ] = chan->midi_program;
++    send_program_change = true;
++  }
++  if( send_program_change ) {
++    if( rdev->buffer_head < rdev->buffer + 123 ) {
++      raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++      *rdev->buffer_head = 0x50 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = chan->midi_program;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = 0x10 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = note;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = vel * chan->gm_volume * chan->gm_expression / 128 / 128;
++      ++rdev->buffer_head;
++      raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++    }
++  }
++  else {
++    if( rdev->buffer_head < rdev->buffer + 125 ) {
++      raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++      *rdev->buffer_head = 0x10 | chan->number;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = note;
++      ++rdev->buffer_head;
++      *rdev->buffer_head = vel * chan->gm_volume * chan->gm_expression / 128 / 128;
++      ++rdev->buffer_head;
++      raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++    }
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_ym2413_note_off(void *p, int note, int vel, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = p;
++  if( rdev->buffer_head < rdev->buffer + 126 ) {
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++    *rdev->buffer_head = 0x20 | chan->number;
++    ++rdev->buffer_head;
++    *rdev->buffer_head = note;
++    ++rdev->buffer_head;
++    raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_ym2413_key_press(void *p, int note, int vel, struct snd_midi_channel *chan) {
++}
++
++void snd_ym2413_terminate_note(void *p, int note, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = p;
++  if( rdev->buffer_head < rdev->buffer + 126 ) {
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++    *rdev->buffer_head = 0x20 | chan->number;
++    ++rdev->buffer_head;
++    *rdev->buffer_head = note;
++    ++rdev->buffer_head;
++    raw_spin_unlock_irqrestore(&rdev->bus_lock, flags);
++  }
++  queue_work( rdev->work_queue, (struct work_struct *)rdev );
++}
++
++void snd_ym2413_control(void *p, int type, struct snd_midi_channel *chan) {
++  unsigned long flags;
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = p;
++  if( type == SNDRV_SEQ_EVENT_PITCHBEND ) {
++    //unsigned int pitch = chan->midi_pitchbend + 8192;
++    raw_spin_lock_irqsave(&rdev->bus_lock, flags);
++//    i2c_smbus_write_byte( rdev->bus, 0x40 | chan->number );
++//    i2c_smbus_write_byte( rdev->bus, pitch & 0x7F );
++//    i2c_smbus_write_byte( rdev->bus, pitch >> 7 );
++    raw_spin_unlock_irqrestore(&rdev->bus_lock,flags);
++  }
++}
++
++void snd_ym2413_nrpn(void *p, struct snd_midi_channel *chan, struct snd_midi_channel_set *chset) {
++}
++
++void snd_ym2413_sysex(void *p, unsigned char *buf, int len, int parsed, struct snd_midi_channel_set *chset) {
++}
++
++struct snd_midi_op ym2413_ops = {
++  .note_on =  snd_ym2413_note_on,
++  .note_off =  snd_ym2413_note_off,
++  .key_press =  snd_ym2413_key_press,
++  .note_terminate = snd_ym2413_terminate_note,
++  .control =  snd_ym2413_control,
++  .nrpn =   snd_ym2413_nrpn,
++  .sysex =  snd_ym2413_sysex,
++};
++
++/*
++ * event input callback - just redirect events to subscribers
++ */
++static int ym2413_input(struct snd_seq_event *ev, int direct, void *private_data,
++	    int atomic, int hop) {
++	 struct snd_seq_ym2413_dev *rdev;
++  rdev = private_data;
++  if (!(rdev->flags & SNDRV_PRINTKMIDI_USE))
++    return 0; /* ignored */
++  snd_midi_process_event( &ym2413_ops, ev, rdev->chset );
++  return 0;
++}
++
++static int ym2413_subscribe(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = private_data;
++  if (!try_module_get(rdev->card->module))
++    return -EFAULT;
++  rdev->flags |= SNDRV_PRINTKMIDI_SUBSCRIBE;
++  return 0;
++}
++
++static int ym2413_unsubscribe(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = private_data;
++  rdev->flags &= ~SNDRV_PRINTKMIDI_SUBSCRIBE;
++  module_put(rdev->card->module);
++  return 0;
++}
++
++static int ym2413_use(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = private_data;
++  if (!try_module_get(rdev->card->module))
++    return -EFAULT;
++  rdev->flags |= SNDRV_PRINTKMIDI_USE;
++  return 0;
++}
++
++static int ym2413_unuse(void *private_data, struct snd_seq_port_subscribe *info) {
++  struct snd_seq_ym2413_dev *rdev;
++  rdev = private_data;
++  rdev->flags &= ~SNDRV_PRINTKMIDI_USE;
++  module_put(rdev->card->module);
++  return 0;
++}
++
++
++/*
++ * create a port
++ */
++static struct snd_seq_ym2413_dev *create_port( int client, int type ) {
++	 struct snd_seq_port_info pinfo;
++	 struct snd_seq_port_callback pcb;
++	 struct snd_seq_ym2413_dev *rdev;
++	 if ((rdev = kzalloc(sizeof(*rdev), GFP_KERNEL)) == NULL) return NULL;
++		rdev->client = client;
++		memset(&pinfo, 0, sizeof(pinfo));
++		pinfo.addr.client = client;
++  strcpy( pinfo.name, "ym2413" );
++		pinfo.capability = SNDRV_SEQ_PORT_CAP_READ | SNDRV_SEQ_PORT_CAP_SUBS_READ;
++		pinfo.capability |= SNDRV_SEQ_PORT_CAP_WRITE | SNDRV_SEQ_PORT_CAP_SUBS_WRITE;
++  pinfo.capability |= SNDRV_SEQ_PORT_CAP_DUPLEX;
++  pinfo.type = SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC
++     | SNDRV_SEQ_PORT_TYPE_SOFTWARE
++     | SNDRV_SEQ_PORT_TYPE_PORT;
++  pinfo.midi_channels = 16;
++		memset(&pcb, 0, sizeof(pcb));
++		pcb.owner = THIS_MODULE;
++  pcb.subscribe = ym2413_subscribe;
++  pcb.unsubscribe = ym2413_unsubscribe;
++  pcb.use = ym2413_use;
++  pcb.unuse = ym2413_unuse;
++  pcb.event_input = ym2413_input;
++		pcb.private_data = rdev;
++		pinfo.kernel = &pcb;
++		if ( snd_seq_kernel_client_ctl(client, SNDRV_SEQ_IOCTL_CREATE_PORT, &pinfo) < 0 ) {
++	 	 kfree(rdev);
++		  return NULL;
++	 }
++	 rdev->port = pinfo.addr.port;
++  memset( rdev->current_program, 0, sizeof(int)*16);
++  raw_spin_lock_init(&rdev->bus_lock);
++  return rdev;
++}
++
++static int snd_ym2413_probe(
++  struct i2c_client *bus,
++  const struct i2c_device_id *id_
++) {
++  struct snd_card *card;
++  struct snd_ym2413 *ym2413;
++  struct snd_seq_ym2413_dev *rdev;
++  int err;
++  int client;
++  int status;
++  char buffer[ 1 ];
++  bus->dev.platform_data = NULL;
++  status = i2c_master_recv( bus, buffer, 1 );
++  if( status < 0 ) {
++    dev_err( &bus->dev, "Unable to read from device: %d\n", status );
++    return err;
++  }
++  card = NULL;
++  err = snd_card_new(
++    &bus->dev, -1, NULL, THIS_MODULE, sizeof(struct snd_ym2413 ), &card
++  );
++  if( err < 0 ) {
++    dev_err( &bus->dev, "Unable to create snd_card: %d\n", err );
++    return err;
++  }
++  ym2413 = card->private_data;
++  ym2413->card = card;
++
++ 	/* create client */
++	 client = snd_seq_create_kernel_client( card, 0, "ym2413" );
++	 if ( client < 0 ) {
++    snd_card_free( card );
++		  return client;
++  }
++	 rdev = create_port( client, 0 );
++	 if ( rdev == NULL ) {
++	  	snd_seq_delete_kernel_client( client );
++    snd_card_free( card );
++		  return -ENOMEM;
++	 }
++  ym2413->rdev = rdev;
++  rdev->buffer_head = rdev->buffer;
++  rdev->work_queue = NULL;
++  rdev->card = card;
++  rdev->chset = snd_midi_channel_alloc_set( 16 );
++  if ( rdev->chset == NULL ) {
++    kfree( rdev );
++	  	snd_seq_delete_kernel_client( client );
++    snd_card_free( card );
++    err = -ENOMEM;
++  }
++  rdev->bus = bus;
++  rdev->client = client;
++  rdev->chset->client = client;
++  rdev->chset->private_data = rdev;
++  printk("debug2 %lx\n", (unsigned long)rdev->bus );
++  rdev->work_queue = create_workqueue("ym2413_queue");
++  INIT_WORK( (struct work_struct *)rdev, snd_ym2413_worker );
++
++  strcpy(card->driver, "ym2413");
++  strcpy(card->shortname, "ym2413");
++  sprintf(card->longname, "ym2413 Card %i", card->number);
++  err = snd_card_register(card);
++  if (!err) {
++    bus->dev.platform_data = card;
++    return 0;
++  }
++  kfree( rdev );
++	 snd_seq_delete_kernel_client( client );
++  snd_card_free(card);
++  return err;
++}
++
++static int snd_ym2413_remove( struct i2c_client *bus ) {
++  struct snd_card *card;
++  struct snd_ym2413 *ym2413;
++  struct snd_seq_ym2413_dev *rdev;
++  card = bus->dev.platform_data;
++  if( card ) {
++    ym2413 = card->private_data;
++    if( ym2413 ) {
++      rdev = ym2413->rdev;
++      if( rdev ) {
++        if( rdev->work_queue ) {
++          flush_workqueue( rdev->work_queue );
++          destroy_workqueue( rdev->work_queue );
++        }
++        snd_midi_channel_free_set( rdev->chset );
++        snd_seq_delete_kernel_client( rdev->client );
++        kfree( rdev );
++      }
++    }
++    snd_card_free( card );
++  }
++  return 0;
++}
++
++static struct i2c_device_id snd_ym2413_idtable[] = {
++  { "ym2413", 0 },
++  { }
++};
++
++
++static struct i2c_driver snd_ym2413_driver = {
++  .driver = {
++    .name = "snd_ym2413",
++  },
++  .probe    = snd_ym2413_probe,
++  .remove   = snd_ym2413_remove,
++  .id_table = snd_ym2413_idtable,
++};
++
++module_i2c_driver( snd_ym2413_driver );
++
++MODULE_AUTHOR("Naomasa Matsubayashi <>");
++MODULE_DESCRIPTION("YM2413 I2C Client Driver");
++MODULE_LICENSE("GPL");
++
+diff -urN a/sound/drivers/ym2413.c.orig b/sound/drivers/ym2413.c.orig
+--- a/sound/drivers/ym2413.c.orig	1970-01-01 09:00:00.000000000 +0900
++++ b/sound/drivers/ym2413.c.orig	2015-07-22 14:56:09.035568348 +0900
+@@ -0,0 +1,167 @@
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <sound/core.h>
++#include <sound/seq_kernel.h>
++#include <sound/seq_midi_emul.h>
++
++static struct i2c_device_id snd_ym2413_idtable[] = {
++    { "ym2413", 0 },
++    { }
++};
++MODULE_DEVICE_TABLE( i2c, snd_ym2413_idtable );
++
++struct snd_ym2413 {
++  struct snd_card *card;
++  int seq_client;
++  struct snd_midi_channel_set * chset;
++  struct i2c_client *bus;
++};
++
++static int snd_ym2413_synth_use( void *private_data, struct snd_seq_port_subscribe * info ) {
++  return 0;
++}
++static int snd_ym2413_synth_unuse( void *private_data, struct snd_seq_port_subscribe * info ) {
++  return 0;
++}
++
++void snd_ym2413_note_on(void *p, int note, int vel, struct snd_midi_channel *chan) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_note_off( void *p, int note, int vel, struct snd_midi_channel *chan ) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_key_press( void *p, int note, int vel, struct snd_midi_channel *chan ) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_terminate_note( void *p, int note, struct snd_midi_channel *chan ) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_control( void *p, int type, struct snd_midi_channel *chan ) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_nrpn( void *p, struct snd_midi_channel *chan, struct snd_midi_channel_set *chset ) {
++  struct snd_ym2413 *ym2413;
++  ym2413 = p;
++}
++
++void snd_ym2413_sysex( void *p, unsigned char *buf, int len, int parsed, struct snd_midi_channel_set *chset ) {
++}
++
++struct snd_midi_op ym2413_ops = {
++  .note_on =  snd_ym2413_note_on,
++  .note_off =  snd_ym2413_note_off,
++  .key_press =  snd_ym2413_key_press,
++  .note_terminate = snd_ym2413_terminate_note,
++  .control =  snd_ym2413_control,
++  .nrpn =   snd_ym2413_nrpn,
++  .sysex =  snd_ym2413_sysex,
++};
++
++static int snd_ym2413_synth_event_input(
++  struct snd_seq_event * event, int direct,
++  void *private_data, int atomic, int hop
++) {
++  struct snd_ym2413 *ym2413 = private_data;
++  snd_midi_process_event( &ym2413_ops, event, ym2413->chset );
++  return 0;
++}
++
++static void snd_ym2413_synth_free_port( void *private_data ) {
++  struct snd_ym2413 *ym2413 = private_data;
++  snd_midi_channel_free_set( ym2413->chset );
++}
++
++static int snd_ym2413_synth_create_port( struct snd_ym2413 *ym2413 ) {
++  return 0;
++}
++
++static int snd_ym2413_probe(
++  struct i2c_client *client,
++  const struct i2c_device_id *id
++) {
++  struct snd_card *card;
++  struct snd_ym2413 *ym2413;
++  struct snd_seq_port_callback callbacks;
++  int seq_client;
++  int err;
++  err = i2c_smbus_read_byte( client );
++  if( err != 0 ) {
++    dev_err( &client->dev, "invalid state: %d\n", err );
++    return err;
++  }
++  err = snd_card_new(
++    &client->dev, client->dev.id, "YM2413", THIS_MODULE, sizeof(struct snd_ym2413 ), &card
++  );
++  if( err < 0 ) {
++    dev_err( &client->dev, "Unable to create snd_card: %d\n", err );
++    return err;
++  }
++  ym2413 = card->private_data;
++  ym2413->card = card;
++  ym2413->bus = client;
++  client->dev.platform_data = ym2413;
++  seq_client = snd_seq_create_kernel_client( ym2413->card, 1, "YM2413" );
++  if( seq_client < 0 ) {
++    dev_err( &client->dev, "Unable to create seq_client: %d\n", err );
++    return err;
++  }
++  if ((err = snd_ym2413_synth_create_port( ym2413 )) < 0) {
++    snd_seq_delete_kernel_client( seq_client );
++    ym2413->seq_client = -1;
++    return err;
++  }
++  ym2413->seq_client = seq_client;
++  ym2413->chset = snd_midi_channel_alloc_set( 16 );
++  memset( &callbacks, 0, sizeof( callbacks ) );
++  callbacks.owner = THIS_MODULE;
++  callbacks.use = snd_ym2413_synth_use;
++  callbacks.unuse = snd_ym2413_synth_unuse;
++  callbacks.event_input = snd_ym2413_synth_event_input;
++  callbacks.private_free = snd_ym2413_synth_free_port;
++  callbacks.private_data = ym2413;
++  ym2413->chset->port = snd_seq_event_port_attach( ym2413->seq_client, &callbacks,
++    SNDRV_SEQ_PORT_CAP_WRITE |
++    SNDRV_SEQ_PORT_CAP_SUBS_WRITE,
++    SNDRV_SEQ_PORT_TYPE_MIDI_GENERIC |
++    SNDRV_SEQ_PORT_TYPE_MIDI_GM |
++    SNDRV_SEQ_PORT_TYPE_DIRECT_SAMPLE |
++    SNDRV_SEQ_PORT_TYPE_HARDWARE |
++    SNDRV_SEQ_PORT_TYPE_SYNTHESIZER,
++    16, 6,
++    "OPLL(YM2413) FM Port"
++  );
++  return 0;
++}
++
++static int snd_ym2413_remove( struct i2c_client *client ) {
++  struct snd_ym2413 *ym2413 = client->dev.platform_data;
++  if( client->dev.platform_data )
++    snd_card_free( ym2413->card );
++  return 0;
++}
++
++static struct i2c_driver snd_ym2413_driver = {
++  .driver = {
++    .name = "ym2413",
++  },
++  .probe    = snd_ym2413_probe,
++  .remove   = snd_ym2413_remove,
++  .id_table = snd_ym2413_idtable,
++};
++
++module_i2c_driver( snd_ym2413_driver );
++
++MODULE_AUTHOR("Naomasa Matsubayashi <>");
++MODULE_DESCRIPTION("YM2413 I2C Client Driver");
++MODULE_LICENSE("GPL");
++
